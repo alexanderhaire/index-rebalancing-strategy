@@ -143,6 +143,5 @@ Discrepancies between Python and Rust results are printed clearly and aid in deb
 
 * **Project PDF Report**: [`index_rebalancing_reportyer.pdf`](./index_rebalancing_reportyer.pdf)
 * **Code Snapshot**: [`Index_Rebalancing_Code.txt`](./Index_Rebalancing_Code.txt)
-* **Candidate Prompt**: [`Quant Trader Candidate Project.pdf`](./Quant%20Trader%20Candidate%20Project.pdf)
 
 ---
