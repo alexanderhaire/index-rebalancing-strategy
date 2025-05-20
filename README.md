@@ -1,114 +1,140 @@
-Quantitative Strategies Group – Index Rebalancing Strategy
-This project fulfills the Quantitative Trader Candidate Project for Quantitative Strategies Group (QSG), showcasing a quantitative trading approach specifically targeting index rebalancing events. It leverages Python and Rust (for cross-validation) to perform backtests, portfolio simulation, and visualize results clearly.
+# Index Rebalancing Strategy
 
-📂 Repository Structure
-perl
-Copy
-Edit
+This project presents a quantitative trading strategy focused on **index rebalancing events**. It combines **Python** for feature engineering, modeling, and simulation with **Rust** for high-speed backtesting and cross-validation. The pipeline is modular, reproducible, and includes performance evaluation and visualization tools.
+
+---
+
+## 📂 Repository Structure
+
 index-rebalancing-strategy/
-├── rant.py                   # Core Python logic (feature engineering, model training, backtesting)
-├── performance.py            # Python performance evaluation metrics
-├── pipeline.sh               # Automation pipeline to run all components easily
-├── visualize.py              # Visualizations of cumulative P&L vs. market benchmark (SPY)
-├── rust_backtester/          # Rust logic for high-speed backtesting and validation
-│   ├── Cargo.toml            # Rust dependencies configuration
-│   └── src/
-│       └── main.rs           # Rust backtester implementation
-├── requirements.txt          # Python dependencies
-└── .gitignore                # Git ignored files
-⚙️ Installation and Setup
-Prerequisites:
-Python 3.11
+├── rant.py # Core Python logic (feature engineering, model training, backtesting)
+├── performance.py # Python performance evaluation metrics
+├── pipeline.sh # One-click pipeline to execute entire strategy and backtest
+├── visualize.py # Strategy and benchmark visualization (P&L curves)
+├── rust_backtester/ # Rust implementation for fast P&L validation
+│ ├── Cargo.toml # Rust dependency config
+│ └── src/
+│ └── main.rs # Rust backtester code
+├── requirements.txt # Python dependencies
+├── rust_backtester_bin # Compiled Rust binary
+└── .gitignore # Ignored files and environments
 
-Rust (cargo)
-
-Git
-
-Step-by-Step Install:
 bash
 Copy
 Edit
-# Clone the repository
+
+---
+
+## ⚙️ Installation & Setup
+
+### Prerequisites:
+- Python 3.11+
+- Rust (`cargo`)
+- Git
+
+### Step-by-Step:
+
+```bash
+# 1. Clone the repository
 git clone https://github.com/alexanderhaire/index-rebalancing-strategy.git
 cd index-rebalancing-strategy
 
-# Set up Python environment
+# 2. Set up Python environment
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Build the Rust backtester
+# 3. Build the Rust backtester
 cd rust_backtester
 cargo build --release
 cp target/release/rust_backtester ../rust_backtester_bin
 cd ..
 
-# Set permissions and run the pipeline
+# 4. Run the full pipeline
 chmod +x pipeline.sh
 ./pipeline.sh
-🚀 Pipeline Execution
-Running the pipeline (./pipeline.sh) does the following:
+🚀 Pipeline Overview
+The ./pipeline.sh script automates the following:
 
-Loads index rebalancing events and prepares data (rant.py)
+Loads and cleans index rebalancing event data from Excel.
 
-Constructs features, backtests strategies, and trains an XGBoost model
+Performs backtests on momentum and mean-reversion strategies.
 
-Computes portfolio returns and exports data for Rust validation
+Trains an XGBoost regression model using engineered features.
 
-Performs Rust-based backtesting and compares with Python results
+Simulates portfolio returns based on model-driven allocation.
 
-Generates visual performance charts
+Exports results for Rust-based validation.
+
+Runs a Rust P&L backtester for cross-validation.
+
+Generates a chart comparing strategy performance vs. SPY.
 
 📈 Performance Metrics
-Your pipeline outputs clear metrics including:
-
-Total cumulative return
-
-Mean and standard deviation of returns
-
-Comparative stats (Python vs. Rust) ensuring validation
-
-Sample terminal output from running pipeline:
+The pipeline prints key metrics:
 
 yaml
 Copy
 Edit
-==> Computing performance metrics...
-Python metrics: {'total_return': -0.0899, 'mean_return': -0.1184, 'std_dev': 0.0575}
-Rust metrics:   {'total_return': -0.0899, 'mean_return': -0.1184, 'std_dev': 0.0575}
-📊 Visualization
-The visualize.py script outputs visual comparisons clearly showcasing cumulative P&L curves for:
+Python metrics:
+  total_return:    -0.0899
+  mean_return:     -0.1184
+  std_dev:         0.0575
 
-Momentum Strategy
+Rust metrics:
+  total_return:    -0.0899
+  mean_return:     -0.1184
+  std_dev:         0.0575
+These metrics are calculated over the lifecycle of simulated trades and help benchmark the strategy's risk-adjusted returns.
 
-Mean Reversion Strategy
+📊 Visual Output
+The visualization script produces:
 
-Combined ML Strategy
+Cumulative P&L curves for:
 
-Market Benchmark (SPY ETF)
+ML Combined strategy
 
-Visual results saved as:
+Momentum strategy
 
+Mean Reversion strategy
+
+SPY (benchmark)
+
+Output saved as:
 pnl_strategies_vs_spy.png
 
-📝 Strategy Overview (Detailed in PDF Report)
-Your strategy captures the structural alpha from index rebalance events by:
+🧠 Strategy Overview
+This strategy captures potential structural alpha during index additions by:
 
-Predicting returns using momentum and mean reversion strategies.
+Using momentum and mean reversion signals engineered from historical price data.
 
-Blending these signals optimally using a trained ML (XGBoost) model.
+Training an XGBoost model to weight these signals intelligently.
 
-Validating robustness through Rust-based backtesting.
+Allocating capital across rebalance events based on the ML-predicted alpha.
 
-Detailed descriptions, assumptions, logic, and tradeoffs are found in the submitted project PDF report (index_rebalancing_reportyer.pdf).
+Pricing synthetic options using QuantLib to simulate real-world overlays.
+
+Validating P&L with a Rust backtester for performance and correctness.
+
+See the full write-up in:
+📄 index_rebalancing_reportyer.pdf
 
 🖥️ Reproducibility
-This project is fully reproducible using instructions provided. Any differences between Python and Rust performance indicate validation success or necessary debugging clearly identified by delta statistics provided in the pipeline output.
+All components (data prep, training, simulation, visualization, and validation) are reproducible through pipeline.sh.
 
-📧 Contact Information
+Discrepancies between Python and Rust results are printed clearly and aid in debugging or validation QA.
+
+📧 Contact
 Author: Alexander Haire
 
-GitHub: https://github.com/alexanderhaire
+GitHub: @alexanderhaire
 
 Email: awh20s@fsu.edu
+
+📎 Supporting Files
+Project PDF Report: index_rebalancing_reportyer.pdf
+
+Code Snapshot: Index_Rebalancing_Code.txt
+
+Candidate Prompt: Quant Trader Candidate Project.pdf
 
