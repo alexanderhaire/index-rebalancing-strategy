@@ -1,8 +1,3 @@
-Great. I’ll prepare a professional `README.md` file for your GitHub repository that documents your Quantitative Trading Strategy Pipeline. It will include an overview, architecture, setup instructions, usage details, and descriptions of each major code component.
-
-I’ll let you know as soon as the draft is ready.
-
-
 # Quantitative Trading Strategy Pipeline
 
 **A hybrid Python/Rust backtesting pipeline for momentum and mean-reversion strategies on index rebalancing events.** This project provides a comprehensive system to backtest trading strategies around index addition events (e.g., stocks being added to S\&P indices). It combines Python for data handling and analysis with Rust for high-performance backtesting, ensuring accuracy and speed. The pipeline loads historical index event data, simulates trades for two strategies (post-announcement momentum and event-day reversion), and outputs performance metrics and charts.
