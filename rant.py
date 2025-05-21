@@ -2,228 +2,253 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import QuantLib as ql
+import pandas_datareader.data as web
 from datetime import timedelta
-from xgboost import XGBRegressor
 
-# Step 0: Load & clean the Excel “Data” sheet
-def load_events_from_excel(path='Index Add Event Data.xlsx') -> pd.DataFrame:
+# -----------------------------------------------------------------------------
+# Constants & Parameters
+# -----------------------------------------------------------------------------
+PORTFOLIO_VALUE    = 5_000_000       # $5 million gross
+TRANSACTION_COST   = 0.01            # $0.01 per share, entry + exit
+LONG_SPREAD        = 0.015           # Fed Funds + 1.5% for longs
+SHORT_SPREAD       = 0.01            # Fed Funds + 1.0% for shorts
+MAX_VOLUME_PCT     = 0.01            # 1% of 20-day average volume
+MOM_HOLD_DAYS      = None            # None = exit on trade date close
+REV_HOLD_DAYS      = 0               # same-day reversion
+FEDFUNDS_SERIES    = 'FEDFUNDS'      # FRED ticker
+
+# -----------------------------------------------------------------------------
+# 0) Load & clean the Excel “Data” sheet
+# -----------------------------------------------------------------------------
+def load_events(path='Index Add Event Data.xlsx') -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name=1)
     df['Announced']  = pd.to_datetime(df['Announced'],   errors='coerce')
     df['Trade Date'] = pd.to_datetime(df['Trade Date'], errors='coerce')
-
-    def clean(series, regex, percent=False):
-        s = series.astype(str).str.replace(regex, '', regex=True)
-        num = pd.to_numeric(s, errors='coerce').fillna(0.0)
-        return num.div(100.0) if percent else num
-
-    df['Last Px']      = clean(df['Last Px'],      r'[$,]')
-    df['Shs to Trade'] = clean(df['Shs to Trade'], r'[^\d]').astype(int)
-    df['$MM to Trade'] = clean(df['$MM to Trade'], r'[$,]')
-    df['ADV to Trade'] = clean(df['ADV to Trade'], r'[%]', percent=True)
-    df['Ticker']       = df['Ticker'].astype(str).str.replace(r'\s+US$', '', regex=True)
-
+    df['Ticker']     = (
+        df['Ticker']
+        .astype(str)
+        .str.replace(r'\s+US$', '', regex=True)
+    )
     return df.sort_values('Announced').reset_index(drop=True)
 
-# Step 1: Extract sector & ADV mappings
-def extract_mappings(events: pd.DataFrame):
-    sectors = events.set_index('Ticker')['Sector']
-    adv     = events.set_index('Ticker')['ADV to Trade']
-    return sectors, adv
-
-# Step 2: Fetch price data and log missing tickers
-def fetch_price_data(tickers, start, end, auto_adjust=False) -> pd.DataFrame:
-    data = yf.download(tickers, start=start, end=end,
-                       progress=False, auto_adjust=auto_adjust)
-    # pick closing prices
+# -----------------------------------------------------------------------------
+# 1) Fetch price & volume data (Open, Close, Volume)
+# -----------------------------------------------------------------------------
+def fetch_price_data(tickers, start, end) -> pd.DataFrame:
+    data = yf.download(
+        tickers,
+        start=start,
+        end=end + timedelta(days=1),
+        progress=False,
+        auto_adjust=False
+    )
+    # we need Open, Close, Volume
     if isinstance(data.columns, pd.MultiIndex):
-        df = data['Adj Close'] if 'Adj Close' in data.columns.levels[0] else data['Close']
+        opens   = data['Open']
+        closes  = data['Close']
+        volume  = data['Volume']
     else:
-        if 'Adj Close' in data.columns:
-            df = data['Adj Close']
-        elif 'Close' in data.columns:
-            df = data['Close']
-        else:
-            df = data.copy()
+        opens   = data[['Open']]
+        closes  = data[['Close']]
+        volume  = data[['Volume']]
 
-    # ensure DataFrame
-    if isinstance(df, pd.Series):
-        df = df.to_frame()
+    # drop tickers without any data
+    valid_tix = [t for t in closes.columns if not closes[t].isna().all()]
+    opens  = opens[valid_tix]
+    closes = closes[valid_tix]
+    volume = volume[valid_tix]
 
-    available = df.columns.tolist()
-    missing = [t for t in tickers if t not in available]
-    if missing:
-        print("⚠️ Missing price data for:", missing)
-    return df
+    return opens, closes, volume
 
-# Step 3: Option pricing via QuantLib
+# -----------------------------------------------------------------------------
+# 2) Fetch Fed Funds for financing costs
+# -----------------------------------------------------------------------------
+def fetch_fed_funds(start, end) -> pd.Series:
+    ff = web.DataReader(FEDFUNDS_SERIES, 'fred', start, end)
+    ff = ff.ffill().bfill() / 100.0   # convert % to decimal
+    return ff['FEDFUNDS']
+
+# -----------------------------------------------------------------------------
+# 3) Compute 20-day avg volume cap
+# -----------------------------------------------------------------------------
+def compute_avg_volume_cap(volume: pd.DataFrame) -> pd.DataFrame:
+    avg20 = volume.rolling(window=20).mean()
+    cap   = (avg20 * MAX_VOLUME_PCT).fillna(0).astype(int)
+    return cap
+
+# -----------------------------------------------------------------------------
+# 4) Backtest Post-Announcement Momentum
+# -----------------------------------------------------------------------------
+def backtest_momentum(events, opens, closes, volume_cap, ff_rates):
+    pnls = []
+    for _, r in events.iterrows():
+        ann = r['Announced']
+        td  = r['Trade Date']
+        tkr = r['Ticker']
+
+        entry_date = ann + timedelta(days=1)
+        exit_date  = td
+
+        if entry_date not in opens.index or exit_date not in closes.index:
+            pnls.append(np.nan)
+            continue
+
+        entry_price = opens.at[entry_date, tkr]
+        exit_price  = closes.at[exit_date, tkr]
+
+        # share sizing: equal-dollar allocation per trade
+        allocation = PORTFOLIO_VALUE / len(events)
+        raw_shares = int(allocation / entry_price)
+
+        # enforce 1% avg-vol cap
+        max_shares = volume_cap.at[entry_date, tkr] if tkr in volume_cap.columns else 0
+        shares     = min(raw_shares, max_shares)
+
+        if shares <= 0:
+            pnls.append(0.0)
+            continue
+
+        # raw PnL
+        raw_pnl = (exit_price - entry_price) * shares
+
+        # transaction costs (entry + exit)
+        tc = shares * TRANSACTION_COST * 2
+
+        # financing cost: days held
+        days_held = (exit_date - entry_date).days
+        # use long financing
+        daily_rate = ff_rates.reindex(
+            pd.date_range(entry_date, exit_date, freq='B'),
+            method='ffill'
+        ) + LONG_SPREAD
+        financing = entry_price * shares * daily_rate.sum()
+
+        net_pnl = raw_pnl - tc - financing
+        pnls.append(net_pnl)
+
+    return pd.Series(pnls, index=events.index)
+
+# -----------------------------------------------------------------------------
+# 5) Backtest Event-Day Reversion
+# -----------------------------------------------------------------------------
+def backtest_reversion(events, opens, closes, volumes, volume_cap):
+    pnls = []
+    # load index benchmark (using SPY)
+    spy_open  = opens['SPY']
+    spy_close = closes['SPY']
+
+    for _, r in events.iterrows():
+        td  = r['Trade Date']
+        tkr = r['Ticker']
+
+        if td not in opens.index or td not in closes.index:
+            pnls.append(np.nan)
+            continue
+
+        entry_price = opens.at[td, tkr]
+        exit_price  = closes.at[td, tkr]
+
+        # determine signal: long if stock underperforms SPY, else short
+        stock_ret = (exit_price / entry_price) - 1
+        spy_ret   = (spy_close.at[td] / spy_open.at[td]) - 1
+        signal    = 1 if stock_ret < spy_ret else -1
+
+        # share sizing
+        allocation = PORTFOLIO_VALUE / len(events)
+        raw_shares = int(allocation / entry_price)
+        max_shares = volume_cap.at[td, tkr]
+        shares     = min(raw_shares, max_shares)
+
+        if shares <= 0:
+            pnls.append(0.0)
+            continue
+
+        # raw PnL (include sign)
+        raw_pnl = signal * (exit_price - entry_price) * shares
+
+        # transaction costs
+        tc = shares * TRANSACTION_COST * 2
+
+        # no overnight financing for same-day trade
+        net_pnl = raw_pnl - tc
+        pnls.append(net_pnl)
+
+    return pd.Series(pnls, index=events.index)
+
+# -----------------------------------------------------------------------------
+# 6) (Optional) Option Pricing via QuantLib (unchanged)
+# -----------------------------------------------------------------------------
 def price_option(date: pd.Timestamp, spot_price: float,
                  strike_offset: float = 0.02, expiry_days: int = 30) -> float:
     cal = ql.UnitedStates(ql.UnitedStates.NYSE)
-    ql.Settings.instance().evaluationDate = ql.Date(date.day, date.month, date.year)
+    ql.Settings.instance().evaluationDate = ql.Date(
+        date.day, date.month, date.year
+    )
 
     strike   = spot_price * (1 + strike_offset)
-    maturity = cal.advance(ql.Date(date.day, date.month, date.year), expiry_days, ql.Days)
+    maturity = cal.advance(
+        ql.Date(date.day, date.month, date.year),
+        expiry_days,
+        ql.Days
+    )
     payoff   = ql.PlainVanillaPayoff(ql.Option.Call, strike)
     exercise = ql.EuropeanExercise(maturity)
 
     process = ql.BlackScholesMertonProcess(
         ql.QuoteHandle(ql.SimpleQuote(spot_price)),
-        ql.YieldTermStructureHandle(ql.FlatForward(0, cal, 0.0, ql.Actual365Fixed())),
-        ql.YieldTermStructureHandle(ql.FlatForward(0, cal, 0.01, ql.Actual365Fixed())),
-        ql.BlackVolTermStructureHandle(ql.BlackConstantVol(0, cal, 0.2, ql.Actual365Fixed()))
+        ql.YieldTermStructureHandle(
+            ql.FlatForward(0, cal, 0.0, ql.Actual365Fixed())
+        ),
+        ql.YieldTermStructureHandle(
+            ql.FlatForward(0, cal, 0.01, ql.Actual365Fixed())
+        ),
+        ql.BlackVolTermStructureHandle(
+            ql.BlackConstantVol(0, cal, 0.2, ql.Actual365Fixed())
+        )
     )
 
     option = ql.VanillaOption(payoff, exercise)
     option.setPricingEngine(ql.AnalyticEuropeanEngine(process))
     return option.NPV()
 
-# Step 4: Simple backtests
-def backtest_momentum(events, prices):
-    rets = []
-    for _, r in events.iterrows():
-        ann, td, t = r['Announced'], r['Trade Date'], r['Ticker']
-        try:
-            entry = prices.at[ann + timedelta(days=1), t]
-            exit_ = prices.at[td, t]
-            rets.append((exit_ - entry) / entry)
-        except Exception:
-            rets.append(np.nan)
-    return pd.Series(rets, index=events.index)
+# -----------------------------------------------------------------------------
+# 7) Simulate & report combined PnL
+# -----------------------------------------------------------------------------
+def simulate(events, opens, closes, volume, ff_rates):
+    # precompute
+    volume_cap = compute_avg_volume_cap(volume)
 
-def backtest_reversion(events, prices, hold_days=3):
-    rets = []
-    for _, r in events.iterrows():
-        td, t = r['Trade Date'], r['Ticker']
-        try:
-            entry = prices.at[td, t]
-            exit_ = prices.at[td + timedelta(days=hold_days), t]
-            rets.append((entry - exit_) / entry)
-        except Exception:
-            rets.append(np.nan)
-    return pd.Series(rets, index=events.index)
+    # backtests
+    mom_pnls = backtest_momentum(events, opens, closes, volume_cap, ff_rates)
+    rev_pnls = backtest_reversion(events, opens, closes, volume, volume_cap)
 
-# Step 5: Feature engineering
-def build_features(events, prices, sectors, adv):
-    feats = pd.DataFrame(index=events.index)
-    feats['days_to_trade'] = (events['Trade Date'] - events['Announced']).dt.days
+    # combine
+    total_pnl = (mom_pnls.fillna(0) + rev_pnls.fillna(0)).cumsum()
+    return total_pnl
 
-    vol = prices.pct_change().rolling(10).std()
-    feats['volatility'] = [
-        vol.at[dt, t] if dt in vol.index and t in vol.columns else 0
-        for dt, t in zip(events['Announced'], events['Ticker'])
-    ]
-
-    one_hot = pd.get_dummies(sectors).reindex(events['Ticker']).set_index(events.index).fillna(0)
-    feats = feats.join(one_hot)
-    feats['adv_pct'] = events['ADV to Trade']
-
-    ma5 = prices.pct_change().rolling(5).mean()
-    feats['ma5'] = [
-        ma5.at[dt, t] if dt in ma5.index and t in ma5.columns else 0
-        for dt, t in zip(events['Announced'], events['Ticker'])
-    ]
-
-    vix = fetch_price_data(
-        ['^VIX'],
-        start=events['Announced'].min() - timedelta(20),
-        end=events['Trade Date'].max() + timedelta(20),
-        auto_adjust=False
-    )
-    vix_ser = vix['^VIX'] if '^VIX' in vix.columns else vix.iloc[:,0]
-    feats['vix10'] = [vix_ser.rolling(10).mean().get(dt, 0) for dt in events['Announced']]
-
-    return feats.fillna(0)
-
-# Step 6: Train XGBoost model
-def train_ml_model(features, targets):
-    model = XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.05)
-    model.fit(features, targets)
-    return model
-
-# Step 7: Capital allocation with caps & costs
-def allocate_capital(model, features, cost_per_trade=0.0005, max_pos=0.1):
-    preds = model.predict(features)
-    df    = pd.DataFrame(preds, index=features.index, columns=['mom','rev'])
-    alloc = df.div(df.sum(axis=1), axis=0).clip(upper=max_pos)
-    return alloc.sub(cost_per_trade).clip(lower=0)
-
-# Step 8: Simulate portfolio P&L
-def simulate_portfolio(events, prices, mom_ret, rev_ret, alloc):
-    pnl = []
-    for idx, r in events.iterrows():
-        t, td = r['Ticker'], r['Trade Date']
-        try:
-            base = alloc.at[idx,'mom'] * mom_ret.at[idx] + alloc.at[idx,'rev'] * rev_ret.at[idx]
-            opt  = price_option(td, prices.at[td, t])
-            pnl.append(base + (opt / prices.at[td, t]) * 0.01)
-        except Exception:
-            pnl.append(0)
-    return pd.Series(pnl, index=events.index).cumsum()
-
-# Step 9: Export for Rust backtester
-def export_for_rust(events, prices, alloc, out_path='rust_input.csv'):
-    df = events[['Announced','Trade Date','Ticker']].copy()
-    df = df.join(alloc.rename(columns={'mom':'mom_score','rev':'rev_score'}))
-    df['price'] = [
-        prices.at[r['Announced'], r['Ticker']]
-        if r['Announced'] in prices.index and r['Ticker'] in prices.columns else 0
-        for _, r in events.iterrows()
-    ]
-    df.to_csv(out_path, index=False)
-    print(f"Exported to {out_path}")
-
+# -----------------------------------------------------------------------------
 # Main execution
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    events = load_events_from_excel()
-    sectors, adv = extract_mappings(events)
+    # load events
+    events = load_events()
 
-    # Initial ticker list
-    tickers = events['Ticker'].unique().tolist()
+    # fetch prices
+    start = events['Announced'].min() - timedelta(days=30)
+    end   = events['Trade Date'].max() + timedelta(days=1)
+    tickers = events['Ticker'].unique().tolist() + ['SPY']
+    opens, closes, volume = fetch_price_data(tickers, start, end)
 
-    # 1) Fetch full price history to identify available tickers
-    all_prices = fetch_price_data(
-        tickers + ['SPY'],
-        start=events['Announced'].min() - timedelta(20),
-        end=events['Trade Date'].max() + timedelta(20),
-        auto_adjust=False
-    )
+    # filter events to those with data
+    valid_mask = events['Ticker'].isin(closes.columns)
+    events     = events[valid_mask].reset_index(drop=True)
 
-    # 2) Filter to only tickers with data
-    available = all_prices.columns.tolist()
-    available_tickers = [t for t in tickers if t in available]
-    print("✅ Using tickers:", available_tickers)
+    # fetch Fed Funds
+    ff_rates = fetch_fed_funds(start, end)
 
-    # (Optional) save valid tickers
-    with open('valid_tickers.txt','w') as f:
-        for t in available_tickers:
-            f.write(t + "\n")
+    # run simulation
+    pnl = simulate(events, opens, closes, volume, ff_rates)
 
-    # 3) Subset price DataFrame
-    prices = all_prices[available_tickers + ['SPY']]
-
-    # Run backtests, features, model, simulation
-    mom   = backtest_momentum(events, prices)
-    rev   = backtest_reversion(events, prices)
-    feats = build_features(events, prices, sectors, adv)
-
-    y = pd.DataFrame({'mom': mom, 'rev': rev}).replace([np.inf, -np.inf], np.nan)
-    mask = y.notnull().all(axis=1)
-
-    events = events.loc[mask].reset_index(drop=True)
-    feats  = feats.loc[mask].reset_index(drop=True)
-    mom    = mom.loc[mask].reset_index(drop=True)
-    rev    = rev.loc[mask].reset_index(drop=True)
-    y      = y.loc[mask].reset_index(drop=True)
-
-    print(f"Training on {len(y)} events after dropping invalid labels.")
-    model     = train_ml_model(feats, y)
-    alloc     = allocate_capital(model, feats)
-    portfolio = simulate_portfolio(events, prices, mom, rev, alloc)
-
-    try:
-        from performance import performance_metrics
-        print("Metrics:", performance_metrics(portfolio))
-    except ImportError:
-        print("performance.py not found; skipping metrics.")
-
-    export_for_rust(events, prices, alloc)
+    # output
+    print("Cumulative PnL:")
+    print(pnl.tail(10))
