@@ -1,108 +1,134 @@
 #!/usr/bin/env bash
 set -e
 
-# 1) Python prep & export rust_input.csv
-echo "==> Running Python prep..."
-python rant.py
-
-# 1b) Export Python portfolio to CSV
-echo "==> Exporting Python portfolio to python_portfolio.csv..."
+# 1) Python prep: export mom, rev, and combined PnLs
+echo "==> Running Python prep & exporting Python PnLs to python_pnls.csv..."
 python << 'PYCODE'
 import pandas as pd
 from rant import (
-    load_events_from_excel, extract_mappings, fetch_price_data,
-    backtest_momentum, backtest_reversion, build_features,
-    train_ml_model, allocate_capital, simulate_portfolio
+    load_events,
+    fetch_price_data,
+    fetch_fed_funds,
+    compute_avg_volume_cap,
+    backtest_momentum,
+    backtest_reversion,
+    simulate
 )
 from datetime import timedelta
 
-# load data & mappings
-events  = load_events_from_excel('Index Add Event Data.xlsx')
-sectors, adv = extract_mappings(events)
+# Load & filter events
+events = load_events('Index Add Event Data.xlsx')
+start  = events['Announced'].min() - timedelta(days=30)
+end    = events['Trade Date'].max()   + timedelta(days=1)
 
-# fetch prices for backtests
-tickers = events['Ticker'].unique().tolist()
-prices  = fetch_price_data(
-    tickers + ['SPY'],
-    start=events['Announced'].min() - timedelta(20),
-    end=events['Trade Date'].max() + timedelta(20)
-)
+# Fetch data
+tickers = events['Ticker'].unique().tolist() + ['SPY']
+opens, closes, volume = fetch_price_data(tickers, start, end)
+events = events[events['Ticker'].isin(closes.columns)].reset_index(drop=True)
 
-# compute returns
-mom = backtest_momentum(events, prices)
-rev = backtest_reversion(events, prices)
+# Compute financing & caps
+ff_rates = fetch_fed_funds(start, end)
+vol_cap  = compute_avg_volume_cap(volume)
 
-# build features & filter invalid labels
-feats = build_features(events, prices, sectors, adv)
-y     = pd.DataFrame({'mom': mom, 'rev': rev})
-y.replace([pd.NA, float('inf'), -float('inf')], pd.NA, inplace=True)
-mask = y.notnull().all(axis=1)
+# Compute PnL legs
+mom_pnls = backtest_momentum(events, opens, closes, vol_cap, ff_rates)
+rev_pnls = backtest_reversion(events, opens, closes, volume, vol_cap)
+combined = simulate(events, opens, closes, volume, ff_rates)
 
-events = events.loc[mask].reset_index(drop=True)
-feats  = feats.loc[mask].reset_index(drop=True)
-mom    = mom.loc[mask].reset_index(drop=True)
-rev    = rev.loc[mask].reset_index(drop=True)
-y      = y.loc[mask].reset_index(drop=True)
-
-# train & allocate
-model     = train_ml_model(feats, y)
-alloc     = allocate_capital(model, feats)
-
-# simulate portfolio
-portfolio = simulate_portfolio(events, prices, mom, rev, alloc)
-
-# write out Python curve
-pd.DataFrame({'portfolio': portfolio}).to_csv('python_portfolio.csv', index=False)
+# Dump to CSV
+pd.DataFrame({
+    'mom':       mom_pnls,
+    'rev':       rev_pnls,
+    'portfolio': combined
+}).to_csv('python_pnls.csv', index=False)
 PYCODE
 
-# 1c) Export full price history for Rust
-echo "==> Exporting full price history to prices.csv..."
+# 2) Build rust_input.csv (scores only, dropping NaNs)
+echo "==> Exporting Rust input to rust_input.csv..."
 python << 'PYCODE'
 import pandas as pd
-from rant import load_events_from_excel, fetch_price_data
+from rant import (
+    load_events,
+    fetch_price_data,
+    fetch_fed_funds,
+    compute_avg_volume_cap,
+    backtest_momentum,
+    backtest_reversion
+)
 from datetime import timedelta
 
-events  = load_events_from_excel('Index Add Event Data.xlsx')
-tickers = sorted(set(events['Ticker'].tolist() + ['SPY']))
+# Load & filter events
+events = load_events('Index Add Event Data.xlsx')
+start  = events['Announced'].min() - timedelta(days=30)
+end    = events['Trade Date'].max()   + timedelta(days=1)
 
-start = events['Announced'].min() - timedelta(20)
-end   = events['Trade Date'].max()   + timedelta(20)
+# Fetch data
+tickers = events['Ticker'].unique().tolist() + ['SPY']
+opens, closes, volume = fetch_price_data(tickers, start, end)
+events = events[events['Ticker'].isin(closes.columns)].reset_index(drop=True)
 
-prices = fetch_price_data(tickers, start=start, end=end, auto_adjust=False)
-prices.to_csv('prices.csv')
+# Compute financing & caps
+ff_rates   = fetch_fed_funds(start, end)
+vol_cap    = compute_avg_volume_cap(volume)
+
+# Score events
+mom_scores = backtest_momentum(events, opens, closes, vol_cap, ff_rates)
+rev_scores = backtest_reversion(events, opens, closes, volume, vol_cap)
+
+# Assemble and drop NaNs
+rust_df = events[['Announced','Trade Date','Ticker']].copy()
+rust_df['mom_score'] = mom_scores.values
+rust_df['rev_score'] = rev_scores.values
+rust_df = rust_df.dropna(subset=['mom_score','rev_score'])
+
+# Write Rust input
+rust_df.to_csv('rust_input.csv', index=False)
 PYCODE
 
-# 2) Rust backtest (consume prices.csv & replay Python allocations)
+# 3) Run Rust backtester
 echo "==> Running Rust backtester..."
 ./rust_backtester_bin --input rust_input.csv --output rust_output.csv
 
-
-# 3) Quick compare
+# 4) Compare Rust vs Python Δ P&L
 echo "==> Comparing Rust vs Python Δ P&L..."
-python - << 'PYCODE'
+python << 'PYCODE'
 import pandas as pd
-
 rust = pd.read_csv('rust_output.csv')['pnl']
-py   = pd.read_csv('python_portfolio.csv')['portfolio']
-print("Rust vs Python Δ P&L:\n", (rust - py).describe())
+py   = pd.read_csv('python_pnls.csv')['portfolio']
+print((rust - py).describe())
 PYCODE
 
-# 4) Performance metrics
-echo "==> Computing performance metrics..."
-python - << 'PYCODE'
+# 5) Compute full Python performance metrics (passing events first)
+echo "==> Computing Python performance metrics..."
+python << 'PYCODE'
 import pandas as pd
+from rant import load_events, fetch_price_data
 from performance import performance_metrics
+from datetime import timedelta
 
-py  = pd.read_csv('python_portfolio.csv')['portfolio']
-rus = pd.read_csv('rust_output.csv')['pnl']
-print("Python metrics:", performance_metrics(py))
-print("Rust   metrics:", performance_metrics(rus))
+# Reload & filter events
+events = load_events('Index Add Event Data.xlsx')
+start  = events['Announced'].min() - timedelta(days=30)
+end    = events['Trade Date'].max()   + timedelta(days=1)
+opens, closes, volume = fetch_price_data(
+    events['Ticker'].unique().tolist() + ['SPY'],
+    start, end
+)
+events = events[events['Ticker'].isin(closes.columns)].reset_index(drop=True)
+
+# Load PnL series
+df  = pd.read_csv('python_pnls.csv')
+mom = df['mom']
+rev = df['rev']
+
+# Call with (events, mom_pnls, rev_pnls)
+performance_metrics(events, mom, rev)
 PYCODE
 
-# 5) Visualizations (optional)
+# 6) Optional visualization
 if [ -f visualize.py ]; then
   echo "==> Generating charts..."
-  python visualize.py rust_output.csv python_portfolio.csv
+  python visualize.py python_pnls.csv rust_output.csv
 fi
 
 echo "==> Pipeline complete."

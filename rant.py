@@ -34,7 +34,7 @@ def load_events(path='Index Add Event Data.xlsx') -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # 1) Fetch price & volume data (Open, Close, Volume)
 # -----------------------------------------------------------------------------
-def fetch_price_data(tickers, start, end) -> pd.DataFrame:
+def fetch_price_data(tickers, start, end) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     data = yf.download(
         tickers,
         start=start,
@@ -42,7 +42,7 @@ def fetch_price_data(tickers, start, end) -> pd.DataFrame:
         progress=False,
         auto_adjust=False
     )
-    # we need Open, Close, Volume
+    # extract Open/Close/Volume
     if isinstance(data.columns, pd.MultiIndex):
         opens   = data['Open']
         closes  = data['Close']
@@ -54,9 +54,9 @@ def fetch_price_data(tickers, start, end) -> pd.DataFrame:
 
     # drop tickers without any data
     valid_tix = [t for t in closes.columns if not closes[t].isna().all()]
-    opens  = opens[valid_tix]
-    closes = closes[valid_tix]
-    volume = volume[valid_tix]
+    opens   = opens[valid_tix]
+    closes  = closes[valid_tix]
+    volume  = volume[valid_tix]
 
     return opens, closes, volume
 
@@ -77,10 +77,17 @@ def compute_avg_volume_cap(volume: pd.DataFrame) -> pd.DataFrame:
     return cap
 
 # -----------------------------------------------------------------------------
-# 4) Backtest Post-Announcement Momentum
+# 4) Backtest Post-Announcement Momentum (with dailyized financing)
 # -----------------------------------------------------------------------------
-def backtest_momentum(events, opens, closes, volume_cap, ff_rates):
+def backtest_momentum(events: pd.DataFrame,
+                      opens: pd.DataFrame,
+                      closes: pd.DataFrame,
+                      volume_cap: pd.DataFrame,
+                      ff_rates: pd.Series) -> pd.Series:
+
     pnls = []
+    n_events = len(events)
+
     for _, r in events.iterrows():
         ann = r['Announced']
         td  = r['Trade Date']
@@ -89,39 +96,39 @@ def backtest_momentum(events, opens, closes, volume_cap, ff_rates):
         entry_date = ann + timedelta(days=1)
         exit_date  = td
 
+        # skip if no price data for entry/exit date
         if entry_date not in opens.index or exit_date not in closes.index:
             pnls.append(np.nan)
             continue
 
         entry_price = opens.at[entry_date, tkr]
-        exit_price  = closes.at[exit_date, tkr]
+        exit_price  = closes.at[exit_date,  tkr]
 
-        # share sizing: equal-dollar allocation per trade
-        allocation = PORTFOLIO_VALUE / len(events)
+        # skip if still missing
+        if pd.isna(entry_price) or pd.isna(exit_price):
+            pnls.append(np.nan)
+            continue
+
+        # equal-dollar sizing
+        allocation = PORTFOLIO_VALUE / n_events
         raw_shares = int(allocation / entry_price)
 
-        # enforce 1% avg-vol cap
+        # volume cap
         max_shares = volume_cap.at[entry_date, tkr] if tkr in volume_cap.columns else 0
         shares     = min(raw_shares, max_shares)
-
         if shares <= 0:
             pnls.append(0.0)
             continue
 
-        # raw PnL
+        # raw PnL and costs
         raw_pnl = (exit_price - entry_price) * shares
+        tc      = shares * TRANSACTION_COST * 2
 
-        # transaction costs (entry + exit)
-        tc = shares * TRANSACTION_COST * 2
-
-        # financing cost: days held
-        days_held = (exit_date - entry_date).days
-        # use long financing
-        daily_rate = ff_rates.reindex(
-            pd.date_range(entry_date, exit_date, freq='B'),
-            method='ffill'
-        ) + LONG_SPREAD
-        financing = entry_price * shares * daily_rate.sum()
+        # ---- FIXED FINANCING: convert annual rate to daily ----
+        biz_days   = pd.date_range(entry_date, exit_date, freq='B')
+        ann_rates  = ff_rates.reindex(biz_days, method='ffill') + LONG_SPREAD
+        daily_rate = ann_rates / 252.0
+        financing  = entry_price * shares * daily_rate.sum()
 
         net_pnl = raw_pnl - tc - financing
         pnls.append(net_pnl)
@@ -131,55 +138,59 @@ def backtest_momentum(events, opens, closes, volume_cap, ff_rates):
 # -----------------------------------------------------------------------------
 # 5) Backtest Event-Day Reversion
 # -----------------------------------------------------------------------------
-def backtest_reversion(events, opens, closes, volumes, volume_cap):
+def backtest_reversion(events: pd.DataFrame,
+                       opens: pd.DataFrame,
+                       closes: pd.DataFrame,
+                       volume: pd.DataFrame,
+                       volume_cap: pd.DataFrame) -> pd.Series:
+
     pnls = []
-    # load index benchmark (using SPY)
     spy_open  = opens['SPY']
     spy_close = closes['SPY']
+    n_events  = len(events)
 
     for _, r in events.iterrows():
         td  = r['Trade Date']
         tkr = r['Ticker']
 
+        # skip if missing
         if td not in opens.index or td not in closes.index:
             pnls.append(np.nan)
             continue
 
-        entry_price = opens.at[td, tkr]
+        entry_price = opens.at[td,  tkr]
         exit_price  = closes.at[td, tkr]
+        if pd.isna(entry_price) or pd.isna(exit_price):
+            pnls.append(np.nan)
+            continue
 
-        # determine signal: long if stock underperforms SPY, else short
+        # signal: long if underperforms SPY
         stock_ret = (exit_price / entry_price) - 1
         spy_ret   = (spy_close.at[td] / spy_open.at[td]) - 1
         signal    = 1 if stock_ret < spy_ret else -1
 
-        # share sizing
-        allocation = PORTFOLIO_VALUE / len(events)
+        allocation = PORTFOLIO_VALUE / n_events
         raw_shares = int(allocation / entry_price)
-        max_shares = volume_cap.at[td, tkr]
+        max_shares = volume_cap.at[td, tkr] if tkr in volume_cap.columns else 0
         shares     = min(raw_shares, max_shares)
-
         if shares <= 0:
             pnls.append(0.0)
             continue
 
-        # raw PnL (include sign)
         raw_pnl = signal * (exit_price - entry_price) * shares
-
-        # transaction costs
-        tc = shares * TRANSACTION_COST * 2
-
-        # no overnight financing for same-day trade
-        net_pnl = raw_pnl - tc
-        pnls.append(net_pnl)
+        tc      = shares * TRANSACTION_COST * 2
+        pnls.append(raw_pnl - tc)
 
     return pd.Series(pnls, index=events.index)
 
 # -----------------------------------------------------------------------------
 # 6) (Optional) Option Pricing via QuantLib (unchanged)
 # -----------------------------------------------------------------------------
-def price_option(date: pd.Timestamp, spot_price: float,
-                 strike_offset: float = 0.02, expiry_days: int = 30) -> float:
+def price_option(date: pd.Timestamp,
+                 spot_price: float,
+                 strike_offset: float = 0.02,
+                 expiry_days: int = 30) -> float:
+
     cal = ql.UnitedStates(ql.UnitedStates.NYSE)
     ql.Settings.instance().evaluationDate = ql.Date(
         date.day, date.month, date.year
@@ -215,40 +226,29 @@ def price_option(date: pd.Timestamp, spot_price: float,
 # 7) Simulate & report combined PnL
 # -----------------------------------------------------------------------------
 def simulate(events, opens, closes, volume, ff_rates):
-    # precompute
     volume_cap = compute_avg_volume_cap(volume)
-
-    # backtests
-    mom_pnls = backtest_momentum(events, opens, closes, volume_cap, ff_rates)
-    rev_pnls = backtest_reversion(events, opens, closes, volume, volume_cap)
-
-    # combine
-    total_pnl = (mom_pnls.fillna(0) + rev_pnls.fillna(0)).cumsum()
+    mom_pnls   = backtest_momentum(events, opens, closes, volume_cap, ff_rates)
+    rev_pnls   = backtest_reversion(events, opens, closes, volume, volume_cap)
+    total_pnl  = (mom_pnls.fillna(0) + rev_pnls.fillna(0)).cumsum()
     return total_pnl
 
 # -----------------------------------------------------------------------------
 # Main execution
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # load events
     events = load_events()
-
-    # fetch prices
-    start = events['Announced'].min() - timedelta(days=30)
-    end   = events['Trade Date'].max() + timedelta(days=1)
+    start  = events['Announced'].min() - timedelta(days=30)
+    end    = events['Trade Date'].max() + timedelta(days=1)
     tickers = events['Ticker'].unique().tolist() + ['SPY']
+
     opens, closes, volume = fetch_price_data(tickers, start, end)
 
-    # filter events to those with data
+    # filter events without data
     valid_mask = events['Ticker'].isin(closes.columns)
     events     = events[valid_mask].reset_index(drop=True)
 
-    # fetch Fed Funds
     ff_rates = fetch_fed_funds(start, end)
+    pnl      = simulate(events, opens, closes, volume, ff_rates)
 
-    # run simulation
-    pnl = simulate(events, opens, closes, volume, ff_rates)
-
-    # output
     print("Cumulative PnL:")
     print(pnl.tail(10))

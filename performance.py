@@ -1,5 +1,3 @@
-# performance.py
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -93,7 +91,7 @@ def performance_metrics(
         print(f"\n=== Performance for index: {idx} ===")
         print(seg_df)
 
-    # 3) Equity curves
+    # 3) Equity curves (save to file instead of blocking)
     plt.figure(figsize=(10, 6))
     for name, ret in strategies.items():
         eq = (1 + ret).cumprod()
@@ -103,7 +101,8 @@ def performance_metrics(
     plt.ylabel("Cumulative Return")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    plt.savefig("equity_curves.png")
+    plt.close()
 
 # -----------------------------------------------------------------------------
 # If run as a script, execute the full pipeline
@@ -144,5 +143,5 @@ if __name__ == "__main__":
     mom_pnls = backtest_momentum(events, opens, closes, volume_cap, ff_rates)
     rev_pnls = backtest_reversion(events, opens, closes, volume, volume_cap)
 
-    # 8) Print metrics & show plots
+    # 8) Print metrics & save plot
     performance_metrics(events, mom_pnls, rev_pnls)

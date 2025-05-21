@@ -1,43 +1,60 @@
+import sys
 import pandas as pd
 import matplotlib.pyplot as plt
-from datetime import timedelta
+
 
 def main():
-    # 1) Load the Python & Rust P&L series
-    df_py   = pd.read_csv('python_portfolio.csv')  # column: 'portfolio'
-    df_rust = pd.read_csv('rust_output.csv')       # column: 'pnl'
-    combined = df_py['portfolio'].ffill()
-    rust     = df_rust['pnl'].ffill()
+    # Expect two arguments: Python and Rust PnL CSVs
+    if len(sys.argv) < 3:
+        print("Usage: python visualize.py python_pnls.csv rust_output.csv")
+        sys.exit(1)
+    py_file, rust_file = sys.argv[1], sys.argv[2]
 
-    # 2) Load the Trade Dates from your events sheet for the x-axis
-    events = pd.read_excel('Index Add Event Data.xlsx', sheet_name=1, usecols=['Trade Date'])
-    dates = pd.to_datetime(events['Trade Date'])
-    # If lengths don’t match, fall back to integer index
-    if len(dates) != len(combined):
-        dates = pd.RangeIndex(len(combined))
+    # Load PnL series
+    py_df   = pd.read_csv(py_file)
+    rust_df = pd.read_csv(rust_file)
 
-    # 3) Load SPY price history and compute cumulative return at those dates
-    prices = pd.read_csv('prices.csv', index_col=0, parse_dates=True)
-    spy = prices['SPY'].pct_change().cumsum().ffill()
-    try:
-        spy_on_events = spy.reindex(dates).reset_index(drop=True)
-    except Exception:
-        spy_on_events = spy.iloc[:len(combined)].reset_index(drop=True)
-
-    # 4) Plot everything
+    # Plot combined equity curves
     plt.figure(figsize=(10, 6))
-    plt.plot(dates, combined, '--', label='ML Combined', linewidth=2)
-    plt.plot(dates, rust,     '-',  label='Rust Backtest',   linewidth=2)
-    plt.plot(dates, spy_on_events, ':',  label='SPY Cumulative',   linewidth=2)
-
-    plt.title('Cumulative Returns: ML Strategy vs. Rust Backtest vs. SPY')
-    plt.xlabel('Trade Date')
-    plt.ylabel('Cumulative Return')
+    plt.plot(py_df['portfolio'].cumsum(), label='Python Combined')
+    plt.plot(rust_df['pnl'].cumsum(), '--', label='Rust Combined')
+    plt.title('Combined Equity Curve: Python vs Rust')
+    plt.xlabel('Event Number')
+    plt.ylabel('Cumulative PnL')
     plt.legend()
-    plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig('pnl_strategies_vs_spy.png')
-    plt.show()
+    plt.savefig('combined_equity_curve.png')
+    plt.close()
 
-if __name__ == "__main__":
+    # Attempt to load price history for SPY
+    try:
+        price_hist = pd.read_csv('prices.csv', parse_dates=['Date'])
+        # Pivot if DataFrame is in long format
+        if {'Date', 'Ticker', 'Close'}.issubset(price_hist.columns):
+            close = price_hist.pivot(index='Date', columns='Ticker', values='Close')
+        else:
+            close = price_hist
+
+        if 'SPY' in close.columns:
+            spy = close['SPY'].pct_change().cumsum().ffill()
+            plt.figure(figsize=(10, 4))
+            plt.plot(spy, label='SPY Cumulative')
+            plt.title('SPY Cumulative Returns')
+            plt.xlabel('Date')
+            plt.ylabel('Cumulative Return')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig('spy_cumulative_returns.png')
+            plt.close()
+        else:
+            print("Warning: 'SPY' not found in price history; skipping SPY chart.")
+    except FileNotFoundError:
+        print("Warning: prices.csv not found; skipping SPY chart.")
+
+    print("Charts saved: combined_equity_curve.png")
+    if 'spy' in locals():
+        print("Charts saved: spy_cumulative_returns.png")
+
+
+if __name__ == '__main__':
     main()
